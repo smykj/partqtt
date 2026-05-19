@@ -25,14 +25,14 @@ todo:
 
 // MQTTv3.1.1 section 2.2.1
 enum packet_types {
-  FORBIDDEN1 = 0,   // 0000
-  CONNECT = 1,      // 0001
-  CONNACK = 2,      // 0010
-  PUBLISH = 3,      // 0011
-  PUBACK = 4,       // 0100
-  PUBREC = 5,       // 0101
-  PUBREL = 6,       // 0110
-  PUBCOMP = 7,      // 0111
+  FORBIDDEN1 = 0,   // 0000 not handled
+  CONNECT = 1,      // 0001 message flags not handled
+  CONNACK = 2,      // 0010 the server only sends this
+  PUBLISH = 3,      // 0011 message flags not handled
+  PUBACK = 4,       // 0100 not handled
+  PUBREC = 5,       // 0101 not handled
+  PUBREL = 6,       // 0110 not handled
+  PUBCOMP = 7,      // 0111 not handled
   SUBSCRIBE = 8,    // 1000
   SUBACK = 9,       // 1001
   UNSUBSCRIBE = 10, // 1010
@@ -40,7 +40,7 @@ enum packet_types {
   PINGREQ = 12,     // 1100
   PINGRESP = 13,    // 1101
   DISCONNECT = 14,  // 1110
-  FORBIDDEN2 = 15,  // 1111
+  FORBIDDEN2 = 15,  // 1111 not handled
 };
 
 // packets can be split among multiple reads, and they can probably overlap. i
@@ -63,6 +63,9 @@ typedef struct response {
 typedef struct client {
   packet_t packet;
   int fd;
+  uint32_t keep_alive;
+  uint32_t time_since_last_message;
+  char client_id[23];
 
 } client_t;
 
@@ -105,7 +108,7 @@ int decode_remaining_length(char *bytes, int len) {
     return -1;
   result += ((int)(bytes[3] & 0x7f) << 21);
   if ((bytes[3] & 0x80) == 0) {
-    fprintf(stderr, "ERROR: remaining length has incorrect formatting - the "
+    fprintf(stderr, "WARNING: remaining length has incorrect formatting - the "
                     "4th byte has the most significant bit set to 1.");
   }
   return result;
@@ -134,12 +137,46 @@ void update_expected_len(client_t *client) {
   return;
 }
 
+int publish_packet(client_t *client, char *response) {
+  int length = 0;
+  int position = 0;
+  if ((client->packet.data[0] & 0x0f) != 0) {
+    fprintf(stderr, "WARNING: PUBLISH packet has flags which arent supported "
+                    "by this implementation.\n");
+  }
+  length = decode_remaining_length(&(client->packet.data[1]),
+                                   client->packet.expected_len);
+  if (length < 0) {
+    fprintf(stderr, "WARNING: PUBLISH packet length decoding failed.\n");
+  }
+  position = 1 + length_bytes(length);
+
+  int topic_name_length = client->packet.data[position] << 8;
+  topic_name_length += client->packet.data[position + 1];
+  position += 2;
+  char topic_name[topic_name_length];
+  strcpy(topic_name, &(client->packet.data[position]));
+  position += topic_name_length;
+  int message_length = client->packet.expected_len - position;
+  char message[message_length];
+  strcpy(message, &(client->packet.data[position]));
+  // todo: respond to subscribers to this topic (i assume)
+  return 0;
+}
+
 int handle_packet(client_t *client) {
+#ifdef DEBUG
+  for (int i = 0; i < client->packet.expected_len; ++i) {
+    fprintf(stderr, "DEBUG: packet byte %d: %.8b, %c\n", i,
+            (uint8_t)(client->packet.data[i]), client->packet.data[i]);
+  }
+#endif
   char response_buffer[PCKT_BUF_SIZE];
   int response_length = 0;
   /// todo: handle all packet types
   uint8_t type = (uint8_t)client->packet.data[0] >> 4;
-
+  int length = 0;
+  int position = 0;
   switch (type) {
   case PINGREQ:
     if ((client->packet.data[0] & 0x0f) != 0) {
@@ -149,10 +186,81 @@ int handle_packet(client_t *client) {
     response_buffer[1] = 0;
     response_length = 2;
     break;
+  case CONNECT:
+    // todo: refuse connections as per 3.1.4-1
+    if ((client->packet.data[0] & 0x0f) != 0) {
+      fprintf(stderr, "WARNING: CONNECT packet has invalid flags.\n");
+    }
+    length = decode_remaining_length(&(client->packet.data[1]),
+                                     client->packet.expected_len);
+    if (length < 0) {
+      fprintf(stderr, "WARNING: CONNECT packet length decoding failed.\n");
+    }
+    position = 1 + length_bytes(length);
+    if (client->packet.data[position] != 0x0 ||
+        client->packet.data[position + 1] != 0x4 ||
+        client->packet.data[position + 2] != 'M' ||
+        client->packet.data[position + 3] != 'Q' ||
+        client->packet.data[position + 4] != 'T' ||
+        client->packet.data[position + 5] != 'T') {
+
+      fprintf(stderr,
+              "WARNING: CONNECT packet has a malformed variable header.\n");
+    }
+    position += 6;
+    if (client->packet.data[position] != 0x4) {
+      // todo: send CONNACK with return code 0x1 - unacceptable protocol level
+      // as per 3.1.2-2
+    }
+
+    ++position;
+
+    if (client->packet.data[position] != 0x0) {
+      fprintf(stderr, "WARNING: CONNECT packet has connect flags which arent "
+                      "supported in this implementation.\n");
+    }
+    ++position;
+
+    client->keep_alive += client->packet.data[position] << 8;
+    client->keep_alive += client->packet.data[position + 1];
+    position += 2;
+    // todo: refuse client id duplicate as per 3.1.4-2
+    if (strlen(&(client->packet.data[position])) > 23) {
+
+      response_buffer[0] = (char)(CONNACK << 4);
+      response_buffer[1] = 0x2;
+      response_buffer[2] = 0;
+      response_buffer[3] = 0x2;
+      response_length = 4;
+    } else {
+      strcpy(client->client_id, &(client->packet.data[position]));
+      response_buffer[0] = (char)(CONNACK << 4);
+      response_buffer[1] = 0x2;
+      response_buffer[2] = 0;
+      response_buffer[3] = 0;
+      response_length = 4;
+    }
+    // note: right now this part of the code is accessible even if im refusing
+    // the client
+    // todo: check if im supposed to set the session present packet,
+    // even thou the session content will always be empty
+    break;
+  case PUBLISH:
+    response_length = publish_packet(client, response_buffer);
+    break;
   default:
     fprintf(stderr, "ERROR: invalid/unsupported packet type: %d\n", type);
   }
 
+#ifdef DEBUG
+  for (int i = 0; i < response_length; ++i) {
+    fprintf(stderr, "DEBUG: response byte %d: %.8b, %c\n", i,
+            (uint8_t)(response_buffer[i]), response_buffer[i]);
+  }
+#endif
+  // todo: check if we made any response
+  // todo: make it possible to write multiple responses, possibly to different
+  // clients
   int result = write(client->fd, response_buffer, response_length);
   if (result < response_length) {
     fprintf(stderr, "ERROR: Could not write full response.\n");
@@ -210,7 +318,7 @@ int main(int argc, char *argv[]) {
   int end_server = FALSE, compress_array = FALSE;
   int close_conn;
   char receive_buffer[PCKT_BUF_SIZE];
-  char response_buffer[PCKT_BUF_SIZE];
+  // char response_buffer[PCKT_BUF_SIZE];
   struct sockaddr_in6 addr;
   int timeout;
   int client_buf_size = 8;
@@ -368,11 +476,12 @@ int main(int argc, char *argv[]) {
           // rc = handle_packet(rec_len, receive_buffer, response_buffer);
           rc = packet_builder(&(clients[i]), receive_buffer, rc);
           if (rc < 0) {
-            fprintf(stderr, "  ERROR: handle_packet() failed.\n");
+            fprintf(stderr, "  ERROR: packet_builder() failed.\n");
             close_conn = TRUE;
             break;
           }
-          // NOTE: moving responsibility for responding to client elsewhere
+          // NOTE: moving responsibility for responding to client into
+          // handle_packet
 
           // int n = write(fds[i].fd, response_buffer, response_length);
           // if (n < response_length) {
@@ -399,6 +508,11 @@ int main(int argc, char *argv[]) {
           for (j = i; j < nfds - 1; j++) {
             fds[j].fd = fds[j + 1].fd;
             clients[j].fd = clients[j + i].fd;
+            // NOTE: these are huge copies - client.packet has the entire packet
+            // buffer, currently 1KB. Allegedly speed is not important, but it
+            // might be worth fixing this. (another problem is that im
+            // allocating it contiguously for no reason, relying on having a
+            // massive contiguous block of memory)
             clients[j].packet = clients[j + i].packet;
           }
           i--;
