@@ -1,5 +1,5 @@
 #include <stdint.h>
-// #include <sys/queue.h>
+#include <sys/queue.h>
 #define DEBUG
 #include <errno.h>
 #include <netinet/in.h>
@@ -16,6 +16,61 @@
 #define PCKT_BUF_SIZE 1024
 #define TRUE 1
 #define FALSE 0
+
+typedef struct item {
+  char *value;
+  SLIST_ENTRY(item) items;
+} item_t;
+
+typedef SLIST_HEAD(head_struct, item) head_t;
+
+void insert_val(
+    head_t *head, char *topic,
+    int topic_len) { // expects to recieve strings which arent null-terminated
+  item_t *ptr = malloc(sizeof(item_t));
+  if (ptr == NULL) {
+    fprintf(stderr, "ERROR: malloc failed\n");
+    exit(EXIT_FAILURE);
+  }
+
+  char *val = malloc(sizeof(char) * topic_len + 1);
+  if (val == NULL) {
+    free(ptr);
+    fprintf(stderr, "ERROR: malloc failed\n");
+    exit(EXIT_FAILURE);
+  }
+
+  memcpy(val, topic, topic_len);
+  val[topic_len] = 0; // now its null terminated
+  ptr->value = val;
+  SLIST_INSERT_HEAD(head, ptr, items);
+}
+
+void free_slist(head_t *head) {
+  item_t *ptr = NULL;
+  while (!SLIST_EMPTY(head)) {
+    ptr = SLIST_FIRST(head);
+    SLIST_REMOVE(head, ptr, item, items);
+    free(ptr->value);
+    free(ptr);
+    ptr = NULL;
+  }
+}
+
+void print_slist(head_t *head) {
+  item_t *ptr = NULL;
+  SLIST_FOREACH(ptr, head, items) { printf("%s\n", ptr->value); }
+}
+int search_slist(head_t *head,
+                 char *topic) { // expects topic to be null-terminated
+  item_t *ptr = NULL;
+  SLIST_FOREACH(ptr, head, items) {
+    if (strcmp(topic, ptr->value) == 0) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
 /*
 todo:
 - probably create structs for every packet type
@@ -45,8 +100,8 @@ enum packet_types {
 
 // packets can be split among multiple reads, and they can probably overlap. i
 // hope its correct to assume that one client will keep writing from the same
-// address, otherwise i have no way to tell which parts of packets im supposed
-// to connect
+// file descriptor, otherwise i have no way to tell which parts of packets im
+// supposed to connect
 typedef struct packet {
   // enum packet_types type;
   char data[PCKT_BUF_SIZE];
@@ -65,13 +120,14 @@ typedef struct client {
   int fd;
   uint32_t keep_alive;
   uint32_t time_since_last_message;
-  char client_id[23];
-
+  char client_id[23]; // 23 because thats the maximum allowed length
+                      // [MQTT-3.1.3-5]
+  head_t topics;
 } client_t;
 
 int length_bytes(int len) {
-  // retroactively figure out how many bytes were needed for the length. bit of
-  // a hack...
+  // retroactively figure out how many bytes were needed for the length. it's a
+  // bit of a hack...
   if (len <= 127)
     return 1;
   if (len <= 16383)
@@ -113,6 +169,22 @@ int decode_remaining_length(char *bytes, int len) {
   }
   return result;
 }
+
+void encode_remaining_length(int length, char result[4]) {
+  int i = 0;
+  char encodedByte;
+  do {
+    encodedByte = length % 128;
+    length = length / 128;
+    if (length > 0) {
+      encodedByte = encodedByte | 128;
+    }
+    result[i] = encodedByte;
+    ++i;
+  } while (length > 0);
+}
+// this is part of the mechanism for assembling packets, it tries to decode the
+// remaining length so it can get the final packet size
 void update_expected_len(client_t *client) {
   if (client->packet.current_len < 2) {
     // not enough data to know the packet size
@@ -137,49 +209,215 @@ void update_expected_len(client_t *client) {
   return;
 }
 
-int publish_packet(client_t *client, char *response) {
+int handle_connect_packet(client_t *client, char *response) {
   int length = 0;
   int position = 0;
+  // todo: refuse connections as per 3.1.4-1
   if ((client->packet.data[0] & 0x0f) != 0) {
-    fprintf(stderr, "WARNING: PUBLISH packet has flags which arent supported "
-                    "by this implementation.\n");
+    fprintf(stderr, "WARNING: CONNECT packet has invalid flags.\n");
   }
   length = decode_remaining_length(&(client->packet.data[1]),
                                    client->packet.expected_len);
+  if (length < 0) {
+    fprintf(stderr, "WARNING: CONNECT packet length decoding failed.\n");
+  }
+  position = 1 + length_bytes(length);
+  if (client->packet.data[position] != 0x0 ||
+      client->packet.data[position + 1] != 0x4 ||
+      client->packet.data[position + 2] != 'M' ||
+      client->packet.data[position + 3] != 'Q' ||
+      client->packet.data[position + 4] != 'T' ||
+      client->packet.data[position + 5] != 'T') {
+
+    fprintf(stderr,
+            "WARNING: CONNECT packet has a malformed variable header.\n");
+  }
+  position += 6;
+  if (client->packet.data[position] != 0x4) {
+    // todo: send CONNACK with return code 0x1 - unacceptable protocol level
+    // as per 3.1.2-2
+  }
+
+  ++position;
+
+  if (client->packet.data[position] != 0x0) {
+    fprintf(stderr, "WARNING: CONNECT packet has connect flags which arent "
+                    "supported in this implementation.\n");
+  }
+  ++position;
+
+  client->keep_alive += client->packet.data[position] << 8;
+  client->keep_alive += client->packet.data[position + 1];
+  position += 2;
+  // todo: refuse client id duplicate as per 3.1.4-2
+  // todo: make sure client id is always null terminated
+  if (strlen(&(client->packet.data[position])) > 23) {
+
+    response[0] = (char)(CONNACK << 4);
+    response[1] = 0x2;
+    response[2] = 0;
+    response[3] = 0x2;
+    return 4;
+  } else {
+    strcpy(client->client_id, &(client->packet.data[position]));
+    response[0] = (char)(CONNACK << 4);
+    response[1] = 0x2;
+    response[2] = 0;
+    response[3] = 0;
+    return 4;
+  }
+  // todo: check if im supposed to set the session present packet,
+  // even thou the session content will always be empty
+}
+
+int handle_publish_packet(client_t *clients, int cidx, char *response) {
+  int length = 0;
+  int position = 0;
+  if ((clients[cidx].packet.data[0] & 0x0f) != 0) {
+    fprintf(stderr, "WARNING: PUBLISH packet has flags which arent supported "
+                    "by this implementation.\n");
+  }
+  length = decode_remaining_length(&(clients[cidx].packet.data[1]),
+                                   clients[cidx].packet.expected_len);
   if (length < 0) {
     fprintf(stderr, "WARNING: PUBLISH packet length decoding failed.\n");
   }
   position = 1 + length_bytes(length);
 
-  int topic_name_length = client->packet.data[position] << 8;
-  topic_name_length += client->packet.data[position + 1];
+  int topic_name_length = clients[cidx].packet.data[position] << 8;
+  topic_name_length += clients[cidx].packet.data[position + 1];
   position += 2;
-  char topic_name[topic_name_length];
-  strcpy(topic_name, &(client->packet.data[position]));
+  char topic_name[topic_name_length + 1];
+  memcpy(topic_name, &(clients[cidx].packet.data[position]), topic_name_length);
+  topic_name[topic_name_length] =
+      0; // null terminating it so i can use it in strcmp() in search_slist()
   position += topic_name_length;
-  int message_length = client->packet.expected_len - position;
+  int message_length = clients[cidx].packet.expected_len - position;
   char message[message_length];
-  strcpy(message, &(client->packet.data[position]));
-  // todo: respond to subscribers to this topic (i assume)
-  return 0;
+  memcpy(message, &(clients[cidx].packet.data[position]), message_length);
+
+  // writing to every client who subscribed to this topic
+  for (int i = 0; clients[i].fd != 0; ++i) { // clients array is null-terminated
+    if (search_slist(&clients[i].topics, topic_name) ==
+        TRUE) { // we found a client who subscribed to this topic
+
+      // fixed header
+      int response_position = 0;
+      response[response_position] = (uint8_t)(PUBLISH << 4);
+      ++response_position;
+      int lbytes = length_bytes(2 + topic_name_length + message_length);
+      char len[lbytes];
+      encode_remaining_length(2 + topic_name_length + message_length, len);
+      for (int j = 0; j < lbytes; ++j) { // remaining length
+        response[response_position] = len[j];
+        ++response_position;
+      }
+
+      // variable header
+      response[response_position] = (uint16_t)topic_name_length >> 8;
+      ++response_position;
+      response[response_position] =
+          (uint8_t)((uint16_t)topic_name_length & 0x00ff);
+      ++response_position;
+      for (int j = 0; j < topic_name_length; ++j) {
+        response[response_position] = topic_name[j];
+        ++response_position;
+      }
+
+      // payload
+      for (int j = 0; j < message_length; ++j) {
+        response[response_position] = message[j];
+        ++response_position;
+      }
+
+      // write to subscribed client
+      int result = write(clients[i].fd, response, response_position - 1);
+      if (result < response_position - 1) {
+        fprintf(stderr, "ERROR: Could not write full response.\n");
+      }
+    }
+  }
+  return 0; // we're not sending a response to the client that sent the publish
 }
 
-int handle_packet(client_t *client) {
+int subscribe_packet(client_t *client, char *response) {
+  int length = 0;
+  int position = 0;
+  if ((client->packet.data[0] & 0x0f) != 2) {
+    // todo close network connection
+    fprintf(stderr, "WARNING: SUBSCRIBE packet has invalid flags.\n");
+  }
+  length = decode_remaining_length(&(client->packet.data[1]),
+                                   client->packet.expected_len);
+  if (length < 0) {
+    fprintf(stderr, "WARNING: SUBSCRIBE packet length decoding failed.\n");
+  }
+  position = 1 + length_bytes(length);
+  int packet_identifier_position = position;
+  position += 2;
+  if (position >= client->packet.expected_len) {
+    // todo: disconnect, protocol violation, 3.8.3-3
+    return -1;
+  }
+  int topic_counter = 0;
+  // todo: finish the response
+  while (position < client->packet.expected_len) {
+    ++topic_counter;
+    int topic_name_length = client->packet.data[position] << 8;
+    topic_name_length += client->packet.data[position + 1];
+    position += 2;
+    char topic_name[topic_name_length];
+    memcpy(topic_name, &(client->packet.data[position]), topic_name_length);
+    insert_val(&(client->topics), topic_name, topic_name_length);
+    position += topic_name_length;
+    if (client->packet.data[position] != 0) {
+      // todo: close network connection?
+      fprintf(stderr, "WARNING: SUBSCRIBE packet has unsupported QoS.\n");
+    }
+    ++position;
+  }
+  // assembling response
+  // fixed header
+  int response_position = 0;
+  response[response_position] = (uint8_t)(SUBACK << 4);
+  ++response_position;
+  int lbytes = length_bytes(2 + topic_counter);
+  char len[lbytes];
+  encode_remaining_length(2 + topic_counter, len);
+  for (int j = 0; j < lbytes; ++j) { // remaining length
+    response[response_position] = len[j];
+    ++response_position;
+  }
+  // variable header
+  response[response_position] = client->packet.data[packet_identifier_position];
+  ++response_position;
+  response[response_position] =
+      client->packet.data[packet_identifier_position + 1];
+  ++response_position;
+  // payload - we only support QoS 0 and for now there isnt a way for the
+  // subscribtion to fail, so the response is all zeros
+  for (int i = 0; i < topic_counter; ++i) {
+    response[response_position] = 0;
+    ++response_position;
+  }
+  return response_position - 1;
+}
+
+int handle_packet(client_t *clients, int cidx) {
 #ifdef DEBUG
-  for (int i = 0; i < client->packet.expected_len; ++i) {
+  for (int i = 0; i < clients[cidx].packet.expected_len; ++i) {
     fprintf(stderr, "DEBUG: packet byte %d: %.8b, %c\n", i,
-            (uint8_t)(client->packet.data[i]), client->packet.data[i]);
+            (uint8_t)(clients[cidx].packet.data[i]),
+            clients[cidx].packet.data[i]);
   }
 #endif
   char response_buffer[PCKT_BUF_SIZE];
   int response_length = 0;
   /// todo: handle all packet types
-  uint8_t type = (uint8_t)client->packet.data[0] >> 4;
-  int length = 0;
-  int position = 0;
+  uint8_t type = (uint8_t)clients[cidx].packet.data[0] >> 4;
   switch (type) {
   case PINGREQ:
-    if ((client->packet.data[0] & 0x0f) != 0) {
+    if ((clients[cidx].packet.data[0] & 0x0f) != 0) {
       fprintf(stderr, "WARNING: PINGREQ packet has invalid flags.\n");
     }
     response_buffer[0] = (char)(PINGRESP << 4);
@@ -187,66 +425,13 @@ int handle_packet(client_t *client) {
     response_length = 2;
     break;
   case CONNECT:
-    // todo: refuse connections as per 3.1.4-1
-    if ((client->packet.data[0] & 0x0f) != 0) {
-      fprintf(stderr, "WARNING: CONNECT packet has invalid flags.\n");
-    }
-    length = decode_remaining_length(&(client->packet.data[1]),
-                                     client->packet.expected_len);
-    if (length < 0) {
-      fprintf(stderr, "WARNING: CONNECT packet length decoding failed.\n");
-    }
-    position = 1 + length_bytes(length);
-    if (client->packet.data[position] != 0x0 ||
-        client->packet.data[position + 1] != 0x4 ||
-        client->packet.data[position + 2] != 'M' ||
-        client->packet.data[position + 3] != 'Q' ||
-        client->packet.data[position + 4] != 'T' ||
-        client->packet.data[position + 5] != 'T') {
-
-      fprintf(stderr,
-              "WARNING: CONNECT packet has a malformed variable header.\n");
-    }
-    position += 6;
-    if (client->packet.data[position] != 0x4) {
-      // todo: send CONNACK with return code 0x1 - unacceptable protocol level
-      // as per 3.1.2-2
-    }
-
-    ++position;
-
-    if (client->packet.data[position] != 0x0) {
-      fprintf(stderr, "WARNING: CONNECT packet has connect flags which arent "
-                      "supported in this implementation.\n");
-    }
-    ++position;
-
-    client->keep_alive += client->packet.data[position] << 8;
-    client->keep_alive += client->packet.data[position + 1];
-    position += 2;
-    // todo: refuse client id duplicate as per 3.1.4-2
-    if (strlen(&(client->packet.data[position])) > 23) {
-
-      response_buffer[0] = (char)(CONNACK << 4);
-      response_buffer[1] = 0x2;
-      response_buffer[2] = 0;
-      response_buffer[3] = 0x2;
-      response_length = 4;
-    } else {
-      strcpy(client->client_id, &(client->packet.data[position]));
-      response_buffer[0] = (char)(CONNACK << 4);
-      response_buffer[1] = 0x2;
-      response_buffer[2] = 0;
-      response_buffer[3] = 0;
-      response_length = 4;
-    }
-    // note: right now this part of the code is accessible even if im refusing
-    // the client
-    // todo: check if im supposed to set the session present packet,
-    // even thou the session content will always be empty
+    response_length = handle_connect_packet(&clients[cidx], response_buffer);
     break;
   case PUBLISH:
-    response_length = publish_packet(client, response_buffer);
+    response_length = handle_publish_packet(clients, cidx, response_buffer);
+    break;
+  case SUBSCRIBE:
+    response_length = subscribe_packet(&clients[cidx], response_buffer);
     break;
   default:
     fprintf(stderr, "ERROR: invalid/unsupported packet type: %d\n", type);
@@ -261,7 +446,7 @@ int handle_packet(client_t *client) {
   // todo: check if we made any response
   // todo: make it possible to write multiple responses, possibly to different
   // clients
-  int result = write(client->fd, response_buffer, response_length);
+  int result = write(clients[cidx].fd, response_buffer, response_length);
   if (result < response_length) {
     fprintf(stderr, "ERROR: Could not write full response.\n");
   }
@@ -269,44 +454,47 @@ int handle_packet(client_t *client) {
   return 0;
 }
 
-int packet_builder(client_t *client, char *message, int message_len) {
+int packet_builder(client_t *clients, int cidx, char *message,
+                   int message_len) {
 #ifdef DEBUG
   for (int i = 0; i < message_len; ++i) {
     fprintf(stderr, "DEBUG: byte %d: %.8b, %c\n", i, (uint8_t)(message[i]),
             message[i]);
   }
 #endif
-  if (client->packet.expected_len == 0) { // no buffered packet part
-    memcpy(client->packet.data, message, message_len);
-    client->packet.current_len = message_len;
-    update_expected_len(client);
+  if (clients[cidx].packet.expected_len == 0) { // no buffered packet part
+    memcpy(clients[cidx].packet.data, message, message_len);
+    clients[cidx].packet.current_len = message_len;
+    update_expected_len(&clients[cidx]);
 
   } else {
-    memcpy(client->packet.data + client->packet.current_len, message,
-           message_len);
-    client->packet.current_len += message_len;
-    update_expected_len(client);
+    memcpy(clients[cidx].packet.data + clients[cidx].packet.current_len,
+           message, message_len);
+    clients[cidx].packet.current_len += message_len;
+    update_expected_len(&clients[cidx]);
   }
-  while (client->packet.current_len >= client->packet.expected_len &&
-         client->packet.expected_len !=
+  while (clients[cidx].packet.current_len >=
+             clients[cidx].packet.expected_len &&
+         clients[cidx].packet.expected_len !=
              0) { // we have at least one finished packet, we are in a while
                   // loop because theoretically we can receive multiple packets
                   // in one read()
-    handle_packet(client);
+    handle_packet(clients, cidx);
 
     // the data of the handled packet is not erased, be careful not to touch it
-    if (client->packet.current_len == client->packet.expected_len) {
-      client->packet.expected_len = 0;
-      client->packet.current_len = 0;
+    if (clients[cidx].packet.current_len == clients[cidx].packet.expected_len) {
+      clients[cidx].packet.expected_len = 0;
+      clients[cidx].packet.current_len = 0;
     } else {
       // here, there is `expected_len` of a packet that has been handled, and
       // `(current_len - expected_len)` of another packet, so im copying that
       // unhandled part to the start of the buffer and adjusting the lengths
-      memcpy(client->packet.data,
-             &(client->packet.data[client->packet.expected_len]),
-             (client->packet.current_len - client->packet.expected_len));
-      client->packet.current_len -= client->packet.expected_len;
-      update_expected_len(client);
+      memcpy(clients[cidx].packet.data,
+             &(clients[cidx].packet.data[clients[cidx].packet.expected_len]),
+             (clients[cidx].packet.current_len -
+              clients[cidx].packet.expected_len));
+      clients[cidx].packet.current_len -= clients[cidx].packet.expected_len;
+      update_expected_len(&clients[cidx]);
     }
   }
   return 0;
@@ -426,7 +614,9 @@ int main(int argc, char *argv[]) {
 
           printf("  New incoming connection - %d\n", new_sd);
 
-          if (nfds >= client_buf_size) {
+          // + 1 because i always want an empty client at the end, as a
+          // null-termination
+          if (nfds + 1 >= client_buf_size) {
             client_buf_size *= 2;
             fds = realloc(fds, client_buf_size * sizeof(struct pollfd));
             clients = realloc(clients, client_buf_size * sizeof(client_t));
@@ -443,6 +633,7 @@ int main(int argc, char *argv[]) {
           fds[nfds].events = POLLIN;
           clients[nfds].fd = new_sd;
           clients[nfds].packet.expected_len = 0;
+          SLIST_INIT(&(clients[nfds].topics));
           nfds++;
 
         } while (new_sd != -1);
@@ -474,7 +665,7 @@ int main(int argc, char *argv[]) {
           // rc = write(0, buffer, len);
 
           // rc = handle_packet(rec_len, receive_buffer, response_buffer);
-          rc = packet_builder(&(clients[i]), receive_buffer, rc);
+          rc = packet_builder(clients, i, receive_buffer, rc);
           if (rc < 0) {
             fprintf(stderr, "  ERROR: packet_builder() failed.\n");
             close_conn = TRUE;
@@ -505,6 +696,7 @@ int main(int argc, char *argv[]) {
       compress_array = FALSE;
       for (i = 0; i < nfds; i++) {
         if (fds[i].fd == -1) {
+          free_slist(&(clients[i].topics));
           for (j = i; j < nfds - 1; j++) {
             fds[j].fd = fds[j + 1].fd;
             clients[j].fd = clients[j + i].fd;
