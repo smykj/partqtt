@@ -1,6 +1,6 @@
 #include <stdint.h>
 #include <sys/queue.h>
-#define DEBUG
+// #define DEBUG
 #include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 #define SERVER_PORT 1883
-#define PCKT_BUF_SIZE 1024
+#define PCKT_BUF_SIZE 4096
 #define TRUE 1
 #define FALSE 0
 
@@ -71,18 +71,31 @@ int search_slist(head_t *head,
   }
   return FALSE;
 }
-/*
-todo:
-- probably create structs for every packet type
-- create a data structure for remembering clients - linked list? sys/queue.h
-   seems useful for that
-*/
+
+int remove_el_slist(head_t *head,
+                    char *val) { // expects val to be null-terminated
+  int found = FALSE;
+  item_t *ptr = SLIST_FIRST(head);
+  while (1) {
+    if (strcmp(ptr->value, val) == 0) {
+      found = TRUE;
+      break;
+    }
+    ptr = SLIST_NEXT(ptr, items);
+  }
+  if (found) {
+    SLIST_REMOVE(head, ptr, item, items);
+    free(ptr->value);
+    free(ptr);
+  }
+  return found;
+}
 
 // MQTTv3.1.1 section 2.2.1
 enum packet_types {
   FORBIDDEN1 = 0,   // 0000 not handled
   CONNECT = 1,      // 0001 message flags not handled
-  CONNACK = 2,      // 0010 the server only sends this
+  CONNACK = 2,      // 0010
   PUBLISH = 3,      // 0011 message flags not handled
   PUBACK = 4,       // 0100 not handled
   PUBREC = 5,       // 0101 not handled
@@ -120,8 +133,8 @@ typedef struct client {
   int fd;
   uint32_t keep_alive;
   uint32_t time_since_last_message;
-  char client_id[23]; // 23 because thats the maximum allowed length
-                      // [MQTT-3.1.3-5]
+  char client_id[24]; // 24 because 23 is the maximum allowed length, and i want
+                      // it to be null-terminated [MQTT-3.1.3-5]
   head_t topics;
 } client_t;
 
@@ -251,15 +264,23 @@ int handle_connect_packet(client_t *client, char *response) {
   position += 2;
   // todo: refuse client id duplicate as per 3.1.4-2
   // todo: make sure client id is always null terminated
-  if (strlen(&(client->packet.data[position])) > 23) {
 
+  int clientid_length = client->packet.data[position] << 8;
+  clientid_length += client->packet.data[position + 1];
+  position += 2;
+  if (clientid_length > 23) {
+
+    fprintf(stderr, "WARNING: CONNECT packet has client id longer than 23.\n");
     response[0] = (char)(CONNACK << 4);
     response[1] = 0x2;
     response[2] = 0;
     response[3] = 0x2;
     return 4;
   } else {
-    strcpy(client->client_id, &(client->packet.data[position]));
+    memcpy(client->client_id, &(client->packet.data[position]),
+           clientid_length);
+    client->client_id[clientid_length] = 0; // null-terminating it
+    fprintf(stderr, "DEBUG: CONNECT client id: %s.\n", client->client_id);
     response[0] = (char)(CONNACK << 4);
     response[1] = 0x2;
     response[2] = 0;
@@ -269,8 +290,8 @@ int handle_connect_packet(client_t *client, char *response) {
   // todo: check if im supposed to set the session present packet,
   // even thou the session content will always be empty
 }
-
-int handle_publish_packet(client_t *clients, int cidx, char *response) {
+int handle_publish_packet(client_t *clients, int cidx, char *response,
+                          int client_count) {
   int length = 0;
   int position = 0;
   if ((clients[cidx].packet.data[0] & 0x0f) != 0) {
@@ -296,11 +317,18 @@ int handle_publish_packet(client_t *clients, int cidx, char *response) {
   char message[message_length];
   memcpy(message, &(clients[cidx].packet.data[position]), message_length);
 
+  fprintf(stderr, "DEBUG: HEREEEEEEEE\n");
+  int iterations = 0;
   // writing to every client who subscribed to this topic
-  for (int i = 0; clients[i].fd != 0; ++i) { // clients array is null-terminated
+  for (int i = 0; i < client_count; ++i) { // clients array is null-terminated
+    ++iterations;
+    fprintf(stderr, "DEBUG: testing client %d\n", i);
+    if (clients[i].fd == 0)
+      continue;
     if (search_slist(&clients[i].topics, topic_name) ==
         TRUE) { // we found a client who subscribed to this topic
 
+      fprintf(stderr, "DEBUG: SUCCESS\n");
       // fixed header
       int response_position = 0;
       response[response_position] = (uint8_t)(PUBLISH << 4);
@@ -329,28 +357,37 @@ int handle_publish_packet(client_t *clients, int cidx, char *response) {
         response[response_position] = message[j];
         ++response_position;
       }
-
+#ifdef DEBUG
+      for (int i = 0; i < response_position; ++i) {
+        fprintf(stderr, "DEBUG: response byte %d: %.8b, %c\n", i,
+                (uint8_t)(response[i]), response[i]);
+      }
+#endif
       // write to subscribed client
-      int result = write(clients[i].fd, response, response_position - 1);
-      if (result < response_position - 1) {
+      int result = write(clients[i].fd, response, response_position);
+      if (result < response_position) {
         fprintf(stderr, "ERROR: Could not write full response.\n");
       }
     }
   }
+  fprintf(stderr, "DEBUG: iterations %d\n", iterations);
   return 0; // we're not sending a response to the client that sent the publish
 }
 
-int subscribe_packet(client_t *client, char *response) {
+int sub_unsub_packet(client_t *client, char *response) {
+  // SUBSCRIBE and UNSUBSCRIBE packets are so similar i'm handling them with one
+  // function
   int length = 0;
   int position = 0;
+  int sub = (uint8_t)(client->packet.data[0]) >> 4 == SUBSCRIBE;
   if ((client->packet.data[0] & 0x0f) != 2) {
     // todo close network connection
-    fprintf(stderr, "WARNING: SUBSCRIBE packet has invalid flags.\n");
+    fprintf(stderr, "WARNING: SUB/UNSUB packet has invalid flags.\n");
   }
   length = decode_remaining_length(&(client->packet.data[1]),
                                    client->packet.expected_len);
   if (length < 0) {
-    fprintf(stderr, "WARNING: SUBSCRIBE packet length decoding failed.\n");
+    fprintf(stderr, "WARNING: SUB/UNSUB packet length decoding failed.\n");
   }
   position = 1 + length_bytes(length);
   int packet_identifier_position = position;
@@ -360,50 +397,73 @@ int subscribe_packet(client_t *client, char *response) {
     return -1;
   }
   int topic_counter = 0;
-  // todo: finish the response
   while (position < client->packet.expected_len) {
     ++topic_counter;
     int topic_name_length = client->packet.data[position] << 8;
     topic_name_length += client->packet.data[position + 1];
     position += 2;
-    char topic_name[topic_name_length];
+    char topic_name[topic_name_length + 1];
     memcpy(topic_name, &(client->packet.data[position]), topic_name_length);
-    insert_val(&(client->topics), topic_name, topic_name_length);
-    position += topic_name_length;
-    if (client->packet.data[position] != 0) {
-      // todo: close network connection?
-      fprintf(stderr, "WARNING: SUBSCRIBE packet has unsupported QoS.\n");
+    topic_name[topic_name_length] = 0; // null terminating it so i can use it in
+                                       // strcmp() in remove_el_slist()
+    if (sub == TRUE) {
+      insert_val(&(client->topics), topic_name, topic_name_length);
+      position += topic_name_length;
+
+      if (client->packet.data[position] != 0) {
+        // todo: close network connection?
+        fprintf(stderr, "WARNING: SUBSCRIBE packet has unsupported QoS.\n");
+      }
+      ++position;
+    } else {
+      fprintf(stderr, "DEBUG: attempting to remove a topic\n");
+      remove_el_slist(&(client->topics), topic_name);
+      position += topic_name_length;
     }
-    ++position;
   }
   // assembling response
   // fixed header
   int response_position = 0;
-  response[response_position] = (uint8_t)(SUBACK << 4);
-  ++response_position;
-  int lbytes = length_bytes(2 + topic_counter);
-  char len[lbytes];
-  encode_remaining_length(2 + topic_counter, len);
-  for (int j = 0; j < lbytes; ++j) { // remaining length
-    response[response_position] = len[j];
+  if (sub == TRUE) {
+
+    response[response_position] = (uint8_t)(SUBACK << 4);
+    ++response_position;
+    int lbytes = length_bytes(2 + topic_counter);
+    char len[lbytes];
+    encode_remaining_length(2 + topic_counter, len);
+    for (int j = 0; j < lbytes; ++j) { // remaining length
+      response[response_position] = len[j];
+      ++response_position;
+    }
+    // variable header
+    response[response_position] =
+        client->packet.data[packet_identifier_position];
+    ++response_position;
+    response[response_position] =
+        client->packet.data[packet_identifier_position + 1];
+    ++response_position;
+    // payload - we only support QoS 0 and for now there isnt a way for the
+    // subscribtion to fail, so the response is all zeros
+    for (int i = 0; i < topic_counter; ++i) {
+      response[response_position] = 0;
+      ++response_position;
+    }
+  } else {
+    response[response_position] = (uint8_t)(UNSUBACK << 4);
+    ++response_position;
+    response[response_position] = 2;
+    ++response_position;
+    response[response_position] =
+        client->packet.data[packet_identifier_position];
+    ++response_position;
+    response[response_position] =
+        client->packet.data[packet_identifier_position + 1];
     ++response_position;
   }
-  // variable header
-  response[response_position] = client->packet.data[packet_identifier_position];
-  ++response_position;
-  response[response_position] =
-      client->packet.data[packet_identifier_position + 1];
-  ++response_position;
-  // payload - we only support QoS 0 and for now there isnt a way for the
-  // subscribtion to fail, so the response is all zeros
-  for (int i = 0; i < topic_counter; ++i) {
-    response[response_position] = 0;
-    ++response_position;
-  }
-  return response_position - 1;
+  return response_position;
 }
 
-int handle_packet(client_t *clients, int cidx) {
+int handle_packet(client_t *clients, int cidx, int client_count) {
 #ifdef DEBUG
   for (int i = 0; i < clients[cidx].packet.expected_len; ++i) {
     fprintf(stderr, "DEBUG: packet byte %d: %.8b, %c\n", i,
@@ -413,12 +473,15 @@ int handle_packet(client_t *clients, int cidx) {
 #endif
   char response_buffer[PCKT_BUF_SIZE];
   int response_length = 0;
-  /// todo: handle all packet types
   uint8_t type = (uint8_t)clients[cidx].packet.data[0] >> 4;
   switch (type) {
   case PINGREQ:
     if ((clients[cidx].packet.data[0] & 0x0f) != 0) {
       fprintf(stderr, "WARNING: PINGREQ packet has invalid flags.\n");
+    }
+    if ((clients[cidx].packet.data[1]) != 0) {
+      fprintf(stderr,
+              "WARNING: PINGREQ packet has non-zero remaining length.\n");
     }
     response_buffer[0] = (char)(PINGRESP << 4);
     response_buffer[1] = 0;
@@ -428,40 +491,58 @@ int handle_packet(client_t *clients, int cidx) {
     response_length = handle_connect_packet(&clients[cidx], response_buffer);
     break;
   case PUBLISH:
-    response_length = handle_publish_packet(clients, cidx, response_buffer);
+    response_length =
+        handle_publish_packet(clients, cidx, response_buffer, client_count);
     break;
   case SUBSCRIBE:
-    response_length = subscribe_packet(&clients[cidx], response_buffer);
+    response_length = sub_unsub_packet(&clients[cidx], response_buffer);
+    break;
+  case UNSUBSCRIBE:
+    response_length = sub_unsub_packet(&clients[cidx], response_buffer);
+    break;
+  case DISCONNECT:
+    if ((clients[cidx].packet.data[0] & 0x0f) != 0) {
+      fprintf(stderr, "WARNING: DISCONNECT packet has invalid flags.\n");
+    }
+    if ((clients[cidx].packet.data[1]) != 0) {
+      fprintf(stderr,
+              "WARNING: DISCONNECT packet has non-zero remaining length.\n");
+    }
+    // there is no response to DISCONNECT
+    return -1;
     break;
   default:
     fprintf(stderr, "ERROR: invalid/unsupported packet type: %d\n", type);
   }
 
+  if (response_length < 0)
+    return -1;
 #ifdef DEBUG
   for (int i = 0; i < response_length; ++i) {
     fprintf(stderr, "DEBUG: response byte %d: %.8b, %c\n", i,
             (uint8_t)(response_buffer[i]), response_buffer[i]);
   }
 #endif
-  // todo: check if we made any response
   // todo: make it possible to write multiple responses, possibly to different
   // clients
-  int result = write(clients[cidx].fd, response_buffer, response_length);
-  if (result < response_length) {
-    fprintf(stderr, "ERROR: Could not write full response.\n");
+  if (response_length > 0) {
+    int result = write(clients[cidx].fd, response_buffer, response_length);
+    if (result < response_length) {
+      fprintf(stderr, "ERROR: Could not write full response.\n");
+    }
   }
-
   return 0;
 }
 
-int packet_builder(client_t *clients, int cidx, char *message,
-                   int message_len) {
-#ifdef DEBUG
-  for (int i = 0; i < message_len; ++i) {
-    fprintf(stderr, "DEBUG: byte %d: %.8b, %c\n", i, (uint8_t)(message[i]),
-            message[i]);
-  }
-#endif
+int packet_builder(client_t *clients, int cidx, char *message, int message_len,
+                   int client_count) {
+  int result = 0;
+  // #ifdef DEBUG
+  //   for (int i = 0; i < message_len; ++i) {
+  //     fprintf(stderr, "DEBUG: byte %d: %.8b, %c\n", i, (uint8_t)(message[i]),
+  //             message[i]);
+  //   }
+  // #endif
   if (clients[cidx].packet.expected_len == 0) { // no buffered packet part
     memcpy(clients[cidx].packet.data, message, message_len);
     clients[cidx].packet.current_len = message_len;
@@ -479,16 +560,17 @@ int packet_builder(client_t *clients, int cidx, char *message,
              0) { // we have at least one finished packet, we are in a while
                   // loop because theoretically we can receive multiple packets
                   // in one read()
-    handle_packet(clients, cidx);
+    result = handle_packet(clients, cidx, client_count);
 
     // the data of the handled packet is not erased, be careful not to touch it
     if (clients[cidx].packet.current_len == clients[cidx].packet.expected_len) {
       clients[cidx].packet.expected_len = 0;
       clients[cidx].packet.current_len = 0;
     } else {
-      // here, there is `expected_len` of a packet that has been handled, and
-      // `(current_len - expected_len)` of another packet, so im copying that
-      // unhandled part to the start of the buffer and adjusting the lengths
+      // here, there is `expected_len` bytes of a packet that has been handled,
+      // and `(current_len - expected_len)` bytes of another packet, so im
+      // copying that unhandled part to the start of the buffer and adjusting
+      // the lengths
       memcpy(clients[cidx].packet.data,
              &(clients[cidx].packet.data[clients[cidx].packet.expected_len]),
              (clients[cidx].packet.current_len -
@@ -497,7 +579,7 @@ int packet_builder(client_t *clients, int cidx, char *message,
       update_expected_len(&clients[cidx]);
     }
   }
-  return 0;
+  return result;
 }
 
 int main(int argc, char *argv[]) {
@@ -510,9 +592,6 @@ int main(int argc, char *argv[]) {
   struct sockaddr_in6 addr;
   int timeout;
   int client_buf_size = 8;
-  // struct pollfd fds[200]; // might have to make this expandable, cant be
-  // incorporated into the linked list for clients since
-  // poll() needs it to be contiguous (i assume)
   struct pollfd *fds =
       (struct pollfd *)malloc(sizeof(struct pollfd) * client_buf_size);
   client_t *clients = (client_t *)malloc(sizeof(client_t) * client_buf_size);
@@ -525,8 +604,8 @@ int main(int argc, char *argv[]) {
     exit(-1);
   }
 
-  int nfds = 1, current_size = 0, i, j;
-
+  int current_size = 0, i, j;
+  int nfds = 1;
   listen_sd = socket(AF_INET6, SOCK_STREAM, 0);
   if (listen_sd < 0) {
     perror("ERROR: socket() failed");
@@ -576,7 +655,7 @@ int main(int argc, char *argv[]) {
   timeout = (3 * 60 * 1000);
 
   do {
-    printf("Waiting on poll()...\n");
+    fprintf(stderr, "Waiting on poll() on %d descriptors...\n", nfds);
     rc = poll(fds, nfds, timeout);
 
     if (rc < 0) {
@@ -595,12 +674,13 @@ int main(int argc, char *argv[]) {
         continue;
 
       if (fds[i].revents != POLLIN) {
-        printf("  ERROR: revents = %d\n, expected POLLIN", fds[i].revents);
+        fprintf(stderr, "  ERROR: revents = %d\n, expected POLLIN",
+                fds[i].revents);
         end_server = TRUE;
         break;
       }
       if (fds[i].fd == listen_sd) {
-        printf("  Listening socket is readable\n");
+        fprintf(stderr, "  Listening socket is readable\n");
 
         do {
           new_sd = accept(listen_sd, NULL, NULL);
@@ -612,10 +692,10 @@ int main(int argc, char *argv[]) {
             break;
           }
 
-          printf("  New incoming connection - %d\n", new_sd);
+          fprintf(stderr, "  New incoming connection - %d\n", new_sd);
 
-          // + 1 because i always want an empty client at the end, as a
-          // null-termination
+          // + 1 because i always want an empty client at the end with fd set to
+          // -1
           if (nfds + 1 >= client_buf_size) {
             client_buf_size *= 2;
             fds = realloc(fds, client_buf_size * sizeof(struct pollfd));
@@ -635,15 +715,16 @@ int main(int argc, char *argv[]) {
           clients[nfds].packet.expected_len = 0;
           SLIST_INIT(&(clients[nfds].topics));
           nfds++;
-
+          clients[nfds].fd = -1;
         } while (new_sd != -1);
       } else {
-        printf("  Descriptor %d is readable\n", fds[i].fd);
+        fprintf(stderr, "  Descriptor %d is readable\n", fds[i].fd);
         close_conn = FALSE;
 
         do {
           // doesnt wait for the client to finish sending, might be incorrect
-          rc = recv(fds[i].fd, receive_buffer, sizeof(receive_buffer), 0);
+          rc = recv(fds[i].fd, receive_buffer, sizeof(receive_buffer),
+                    MSG_DONTWAIT);
           if (rc < 0) {
             if (errno != EWOULDBLOCK) {
               perror("  ERROR: recv() failed");
@@ -653,33 +734,23 @@ int main(int argc, char *argv[]) {
           }
 
           if (rc == 0) {
-            printf("  Connection closed\n");
+            fprintf(stderr, "  Connection closed on %d\n", fds[i].fd);
             close_conn = TRUE;
             break;
           }
 
           rec_len = rc;
-          fprintf(stderr, "  %d bytes received\n", rec_len);
+          fprintf(stderr, "  %d bytes received from fd %d\n", rec_len,
+                  fds[i].fd);
 
-          // rc = send(fds[i].fd, buffer, len, 0);
-          // rc = write(0, buffer, len);
-
-          // rc = handle_packet(rec_len, receive_buffer, response_buffer);
-          rc = packet_builder(clients, i, receive_buffer, rc);
+          rc = packet_builder(clients, i, receive_buffer, rc, nfds);
           if (rc < 0) {
-            fprintf(stderr, "  ERROR: packet_builder() failed.\n");
+            fprintf(stderr, "WARNING: disconnecting client.\n");
             close_conn = TRUE;
             break;
           }
           // NOTE: moving responsibility for responding to client into
           // handle_packet
-
-          // int n = write(fds[i].fd, response_buffer, response_length);
-          // if (n < response_length) {
-          // fprintf(stderr, "ERROR: Couldnt write the whole response.\n");
-          // close_conn = TRUE;
-          // break;
-          // }
 
         } while (TRUE);
 
@@ -691,7 +762,7 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // maintains size of array, probably optional
+    // array compression after disconnecting client
     if (compress_array) {
       compress_array = FALSE;
       for (i = 0; i < nfds; i++) {
@@ -700,8 +771,10 @@ int main(int argc, char *argv[]) {
           for (j = i; j < nfds - 1; j++) {
             fds[j].fd = fds[j + 1].fd;
             clients[j].fd = clients[j + i].fd;
-            // NOTE: these are huge copies - client.packet has the entire packet
-            // buffer, currently 1KB. Allegedly speed is not important, but it
+            // NOTE: these are huge copies - client.packet has the entire
+            // packet
+            // buffer, currently 1KB. Allegedly speed is not important, but
+            // it
             // might be worth fixing this. (another problem is that im
             // allocating it contiguously for no reason, relying on having a
             // massive contiguous block of memory)
@@ -716,8 +789,10 @@ int main(int argc, char *argv[]) {
   } while (end_server == FALSE);
 
   for (i = 0; i < nfds; i++) {
-    if (fds[i].fd >= 0)
+    if (fds[i].fd >= 0) {
+      free_slist(&(clients[i].topics));
       close(fds[i].fd);
+    }
   }
   free(clients);
   free(fds);
