@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <sys/queue.h>
+#include <time.h>
 // #define DEBUG
 #include <errno.h>
 #include <netinet/in.h>
@@ -13,7 +14,7 @@
 #include <unistd.h>
 
 #define SERVER_PORT 1883
-#define PCKT_BUF_SIZE 4096
+#define PCKT_BUF_SIZE 1024
 #define TRUE 1
 #define FALSE 0
 
@@ -117,22 +118,24 @@ enum packet_types {
 // supposed to connect
 typedef struct packet {
   // enum packet_types type;
-  char data[PCKT_BUF_SIZE];
+  char *data;
+  int buffer_size;
   int expected_len;
   int current_len;
 } packet_t;
 
-typedef struct response {
-  char data[PCKT_BUF_SIZE];
-  int len;
-  int for_fd;
-} response_t;
+// typedef struct response {
+//   char data[PCKT_BUF_SIZE];
+//   int len;
+//   int for_fd;
+// } response_t;
 
 typedef struct client {
   packet_t packet;
   int fd;
   uint32_t keep_alive;
-  uint32_t time_since_last_message;
+  // uint32_t time_since_last_message;
+  time_t last_message;
   char client_id[24]; // 24 because 23 is the maximum allowed length, and i want
                       // it to be null-terminated [MQTT-3.1.3-5]
   head_t topics;
@@ -543,6 +546,17 @@ int packet_builder(client_t *clients, int cidx, char *message, int message_len,
   //             message[i]);
   //   }
   // #endif
+  while (clients[cidx].packet.current_len + message_len >=
+         clients[cidx].packet.buffer_size) {
+    clients[cidx].packet.buffer_size *= 2;
+    clients[cidx].packet.data =
+        realloc(clients[cidx].packet.data,
+                clients[cidx].packet.buffer_size * sizeof(char));
+    if (!clients[cidx].packet.data) {
+      perror("ERROR: Reallocation failed");
+      exit(-1);
+    }
+  }
   if (clients[cidx].packet.expected_len == 0) { // no buffered packet part
     memcpy(clients[cidx].packet.data, message, message_len);
     clients[cidx].packet.current_len = message_len;
@@ -582,6 +596,21 @@ int packet_builder(client_t *clients, int cidx, char *message, int message_len,
   return result;
 }
 
+int disconnect_inactive_clients(client_t *clients, struct pollfd *fds,
+                                int nfds) {
+  int compress_array = FALSE;
+  for (int i = 0; i < nfds; ++i) {
+    if (clients[i].keep_alive > 0 && (time(NULL) - clients[i].last_message) >
+                                         (clients[i].keep_alive * 1.5)) {
+      fprintf(stderr, "WARNING: disconnecting client for inactivity: %d\n",
+              fds[i].fd);
+      close(fds[i].fd);
+      fds[i].fd = -1;
+      compress_array = TRUE;
+    }
+  }
+  return compress_array;
+}
 int main(int argc, char *argv[]) {
   int rec_len, rc, on = 1;
   int listen_sd = -1, new_sd = -1;
@@ -652,7 +681,7 @@ int main(int argc, char *argv[]) {
 
   fds[0].fd = listen_sd;
   fds[0].events = POLLIN;
-  timeout = (3 * 60 * 1000);
+  timeout = 1000; // we have to wake up every second to check keep_alive times
 
   do {
     fprintf(stderr, "Waiting on poll() on %d descriptors...\n", nfds);
@@ -664,8 +693,9 @@ int main(int argc, char *argv[]) {
     }
 
     if (rc == 0) {
-      printf("  poll() timed out.  End program.\n");
-      break;
+      fprintf(stderr, "DEBUG: disconnecting inactive clients\n");
+      compress_array = disconnect_inactive_clients(clients, fds, nfds);
+      // break;
     }
 
     current_size = nfds;
@@ -694,9 +724,7 @@ int main(int argc, char *argv[]) {
 
           fprintf(stderr, "  New incoming connection - %d\n", new_sd);
 
-          // + 1 because i always want an empty client at the end with fd set to
-          // -1
-          if (nfds + 1 >= client_buf_size) {
+          if (nfds >= client_buf_size) {
             client_buf_size *= 2;
             fds = realloc(fds, client_buf_size * sizeof(struct pollfd));
             clients = realloc(clients, client_buf_size * sizeof(client_t));
@@ -713,14 +741,22 @@ int main(int argc, char *argv[]) {
           fds[nfds].events = POLLIN;
           clients[nfds].fd = new_sd;
           clients[nfds].packet.expected_len = 0;
+          clients[nfds].packet.buffer_size = 8;
+          clients[nfds].last_message = time(NULL);
           SLIST_INIT(&(clients[nfds].topics));
+          clients[nfds].packet.data =
+              (char *)malloc(sizeof(char) * clients[nfds].packet.buffer_size);
+          if (clients[nfds].packet.data == NULL) {
+            perror("ERROR: packet_data malloc failed");
+            exit(-1);
+          }
           nfds++;
-          clients[nfds].fd = -1;
         } while (new_sd != -1);
       } else {
         fprintf(stderr, "  Descriptor %d is readable\n", fds[i].fd);
         close_conn = FALSE;
 
+        clients[nfds].last_message = time(NULL);
         do {
           // doesnt wait for the client to finish sending, might be incorrect
           rc = recv(fds[i].fd, receive_buffer, sizeof(receive_buffer),
@@ -762,22 +798,17 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // array compression after disconnecting client
+    // array compression and deallocation of topics and packet data after
+    // disconnecting client
     if (compress_array) {
       compress_array = FALSE;
       for (i = 0; i < nfds; i++) {
         if (fds[i].fd == -1) {
           free_slist(&(clients[i].topics));
+          free(clients[i].packet.data);
           for (j = i; j < nfds - 1; j++) {
             fds[j].fd = fds[j + 1].fd;
             clients[j].fd = clients[j + i].fd;
-            // NOTE: these are huge copies - client.packet has the entire
-            // packet
-            // buffer, currently 1KB. Allegedly speed is not important, but
-            // it
-            // might be worth fixing this. (another problem is that im
-            // allocating it contiguously for no reason, relying on having a
-            // massive contiguous block of memory)
             clients[j].packet = clients[j + i].packet;
           }
           i--;
