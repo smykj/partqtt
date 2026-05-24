@@ -246,9 +246,12 @@ int handle_connect_packet(client_t *clients, int cidx, char *response,
 
   ++position;
 
-  if (clients[cidx].packet.data[position] != 0x0) {
-    fprintf(stderr, "WARNING: CONNECT packet has connect flags which arent "
-                    "supported in this implementation.\n");
+  if (clients[cidx].packet.data[position] != 0x2) {
+    fprintf(stderr,
+            "WARNING: CONNECT packet has connect flags which arent "
+            "supported in this implementation:%d .\n",
+            clients[cidx].packet.data[position]);
+    return -1;
   }
   ++position;
 
@@ -604,7 +607,8 @@ int main(int argc, char *argv[]) {
   int close_conn;
   char receive_buffer[PCKT_BUF_SIZE];
   struct sockaddr_in6 addr;
-  int timeout;
+  int timeout =
+      1000; // we have to wake up every second to check keep_alive times
   int client_buf_size = 8;
   int server_port = 1883;
   signal(SIGINT, handle_shutdown);
@@ -637,7 +641,7 @@ int main(int argc, char *argv[]) {
     exit(-1);
   }
 
-  int current_size = 0, i, j;
+  int current_size = 0;
   int nfds = 1;
   listen_sd = socket(AF_INET6, SOCK_STREAM, 0);
   if (listen_sd < 0) {
@@ -685,7 +689,6 @@ int main(int argc, char *argv[]) {
 
   fds[0].fd = listen_sd;
   fds[0].events = POLLIN;
-  timeout = 1000; // we have to wake up every second to check keep_alive times
 
   do {
     return_code = poll(fds, nfds, timeout);
@@ -701,7 +704,7 @@ int main(int argc, char *argv[]) {
     }
 
     current_size = nfds;
-    for (i = 0; i < current_size; i++) {
+    for (int i = 0; i < current_size; i++) {
       if (fds[i].revents != POLLIN)
         continue;
 
@@ -788,11 +791,11 @@ int main(int argc, char *argv[]) {
     // disconnecting client
     if (compress_array) {
       compress_array = FALSE;
-      for (i = 0; i < nfds; i++) {
+      for (int i = 0; i < nfds; i++) {
         if (fds[i].fd == -1) {
           free_slist(&(clients[i].topics));
           free(clients[i].packet.data);
-          for (j = i; j < nfds - 1; j++) {
+          for (int j = i; j < nfds - 1; j++) {
             fds[j].fd = fds[j + 1].fd;
             clients[j].fd = clients[j + i].fd;
             clients[j].packet = clients[j + i].packet;
@@ -805,7 +808,7 @@ int main(int argc, char *argv[]) {
 
   } while (end_server == FALSE);
 
-  for (i = 0; i < nfds; i++) {
+  for (int i = 0; i < nfds; i++) {
     if (fds[i].fd >= 0) {
       free_slist(&(clients[i].topics));
       free(clients[i].packet.data);
