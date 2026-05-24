@@ -1,15 +1,12 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <signal.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/poll.h>
 #include <sys/queue.h>
-#include <sys/socket.h>
-#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -57,10 +54,6 @@ void free_slist(head_t *head) {
   }
 }
 
-void print_slist(head_t *head) {
-  item_t *ptr = NULL;
-  SLIST_FOREACH(ptr, head, items) { printf("%s\n", ptr->value); }
-}
 int search_slist(head_t *head,
                  char *topic) { // expects topic to be null-terminated
   item_t *ptr = NULL;
@@ -76,7 +69,7 @@ int remove_el_slist(head_t *head,
                     char *val) { // expects val to be null-terminated
   int found = FALSE;
   item_t *ptr = SLIST_FIRST(head);
-  while (1) {
+  while (ptr != NULL) {
     if (strcmp(ptr->value, val) == 0) {
       found = TRUE;
       break;
@@ -91,7 +84,6 @@ int remove_el_slist(head_t *head,
   return found;
 }
 
-// MQTTv3.1.1 section 2.2.1
 enum packet_types {
   FORBIDDEN1 = 0,   // 0000 not handled
   CONNECT = 1,      // 0001 message flags not handled
@@ -116,24 +108,16 @@ enum packet_types {
 // file descriptor, otherwise i have no way to tell which parts of packets im
 // supposed to connect
 typedef struct packet {
-  // enum packet_types type;
   char *data;
   int buffer_size;
   int expected_len;
   int current_len;
 } packet_t;
 
-// typedef struct response {
-//   char data[PCKT_BUF_SIZE];
-//   int len;
-//   int for_fd;
-// } response_t;
-
 typedef struct client {
   packet_t packet;
   int fd;
   uint32_t keep_alive;
-  // uint32_t time_since_last_message;
   time_t last_message;
   char client_id[24]; // 24 because 23 is the maximum allowed length, and i want
                       // it to be null-terminated [MQTT-3.1.3-5]
@@ -152,7 +136,6 @@ int length_bytes(int len) {
   return 4;
 }
 int decode_remaining_length(char *bytes, int len) {
-  // MQTTv3.1.1 section 2.2.3
   // note: i wrote this before i noticed the non normative comment in the
   // specification that gives the algorithm for this, but this works so im
   // keeping it for now
@@ -198,6 +181,7 @@ void encode_remaining_length(int length, char result[4]) {
     ++i;
   } while (length > 0);
 }
+
 // this is part of the mechanism for assembling packets, it tries to decode the
 // remaining length so it can get the final packet size
 void update_expected_len(client_t *client) {
@@ -330,10 +314,8 @@ int handle_publish_packet(client_t *clients, int cidx, char *response,
   char message[message_length];
   memcpy(message, &(clients[cidx].packet.data[position]), message_length);
 
-  int iterations = 0;
   // writing to every client who subscribed to this topic
   for (int i = 0; i < client_count; ++i) { // clients array is null-terminated
-    ++iterations;
     if (clients[i].fd == 0)
       continue;
     if (search_slist(&clients[i].topics, topic_name) ==
@@ -484,11 +466,14 @@ int handle_packet(client_t *clients, int cidx, int client_count) {
   switch (type) {
   case PINGREQ:
     if ((clients[cidx].packet.data[0] & 0x0f) != 0) {
-      fprintf(stderr, "WARNING: PINGREQ packet has invalid flags.\n");
+      fprintf(stderr,
+              "WARNING: PINGREQ packet has invalid flags, disconnecting.\n");
+      return -1;
     }
     if ((clients[cidx].packet.data[1]) != 0) {
-      fprintf(stderr,
-              "WARNING: PINGREQ packet has non-zero remaining length.\n");
+      fprintf(stderr, "WARNING: PINGREQ packet has non-zero remaining length, "
+                      "disconnecting.\n");
+      return -1;
     }
     response_buffer[0] = (char)(PINGRESP << 4);
     response_buffer[1] = 0;
@@ -539,7 +524,8 @@ int packet_builder(client_t *clients, int cidx, char *message, int message_len,
                    int client_count) {
   int result = 0;
   while (clients[cidx].packet.current_len + message_len >=
-         clients[cidx].packet.buffer_size) {
+         clients[cidx]
+             .packet.buffer_size) { // making sure the buffer is large enough
     clients[cidx].packet.buffer_size *= 2;
     clients[cidx].packet.data =
         realloc(clients[cidx].packet.data,
@@ -568,7 +554,7 @@ int packet_builder(client_t *clients, int cidx, char *message, int message_len,
                   // in one read()
     result = handle_packet(clients, cidx, client_count);
 
-    // the data of the handled packet is not erased, be careful not to touch it
+    // the data of the handled packet is not erased, only overwritten
     if (clients[cidx].packet.current_len == clients[cidx].packet.expected_len) {
       clients[cidx].packet.expected_len = 0;
       clients[cidx].packet.current_len = 0;
@@ -611,13 +597,12 @@ static void handle_shutdown(int sig) {
                      // and closes all clients
 }
 int main(int argc, char *argv[]) {
-  int rc, on = 1;
+  int return_code, on = 1;
   int listen_sd = -1, new_sd = -1;
   int compress_array = FALSE;
   end_server = FALSE;
   int close_conn;
   char receive_buffer[PCKT_BUF_SIZE];
-  // char response_buffer[PCKT_BUF_SIZE];
   struct sockaddr_in6 addr;
   int timeout;
   int client_buf_size = 8;
@@ -661,16 +646,17 @@ int main(int argc, char *argv[]) {
   }
 
   // reuse socket descriptors
-  rc = setsockopt(listen_sd, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
-  if (rc < 0) {
+  return_code =
+      setsockopt(listen_sd, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on));
+  if (return_code < 0) {
     perror("ERROR: setsockopt() failed");
     close(listen_sd);
     exit(-1);
   }
 
   // sets socket to be non-blocking
-  rc = ioctl(listen_sd, FIONBIO, (char *)&on);
-  if (rc < 0) {
+  return_code = ioctl(listen_sd, FIONBIO, (char *)&on);
+  if (return_code < 0) {
     perror("ERROR: ioctl() failed");
     close(listen_sd);
     exit(-1);
@@ -680,15 +666,15 @@ int main(int argc, char *argv[]) {
   addr.sin6_family = AF_INET6;
   memcpy(&addr.sin6_addr, &in6addr_any, sizeof(in6addr_any));
   addr.sin6_port = htons(server_port);
-  rc = bind(listen_sd, (struct sockaddr *)&addr, sizeof(addr));
-  if (rc < 0) {
+  return_code = bind(listen_sd, (struct sockaddr *)&addr, sizeof(addr));
+  if (return_code < 0) {
     perror("ERROR: bind() failed");
     close(listen_sd);
     exit(-1);
   }
 
-  rc = listen(listen_sd, 32);
-  if (rc < 0) {
+  return_code = listen(listen_sd, 32);
+  if (return_code < 0) {
     perror("ERROR: listen() failed");
     close(listen_sd);
     exit(-1);
@@ -702,28 +688,23 @@ int main(int argc, char *argv[]) {
   timeout = 1000; // we have to wake up every second to check keep_alive times
 
   do {
-    rc = poll(fds, nfds, timeout);
+    return_code = poll(fds, nfds, timeout);
 
-    if (rc < 0) {
+    if (return_code < 0) {
       perror("ERROR: poll() failed");
       break;
     }
 
-    if (rc == 0) {
+    if (return_code == 0) { // poll timed out
       compress_array = disconnect_inactive_clients(clients, fds, nfds);
+      continue;
     }
 
     current_size = nfds;
     for (i = 0; i < current_size; i++) {
-      if (fds[i].revents == 0)
+      if (fds[i].revents != POLLIN)
         continue;
 
-      if (fds[i].revents != POLLIN) {
-        fprintf(stderr, "ERROR: revents = %d\n, expected POLLIN",
-                fds[i].revents);
-        end_server = TRUE;
-        break;
-      }
       if (fds[i].fd == listen_sd) {
 
         do {
@@ -736,7 +717,8 @@ int main(int argc, char *argv[]) {
             break;
           }
 
-          if (nfds >= client_buf_size) {
+          if (nfds >=
+              client_buf_size) { // making sure client buffers are large enough
             client_buf_size *= 2;
             fds = realloc(fds, client_buf_size * sizeof(struct pollfd));
             clients = realloc(clients, client_buf_size * sizeof(client_t));
@@ -770,9 +752,9 @@ int main(int argc, char *argv[]) {
         clients[nfds].last_message = time(NULL);
         do {
           // doesnt wait for the client to finish sending
-          rc = recv(fds[i].fd, receive_buffer, sizeof(receive_buffer),
-                    MSG_DONTWAIT);
-          if (rc < 0) {
+          return_code = recv(fds[i].fd, receive_buffer, sizeof(receive_buffer),
+                             MSG_DONTWAIT);
+          if (return_code < 0) {
             if (errno != EWOULDBLOCK) {
               perror("ERROR: recv() failed");
               close_conn = TRUE;
@@ -780,13 +762,14 @@ int main(int argc, char *argv[]) {
             break;
           }
 
-          if (rc == 0) {
+          if (return_code == 0) {
             close_conn = TRUE;
             break;
           }
 
-          rc = packet_builder(clients, i, receive_buffer, rc, nfds);
-          if (rc < 0) {
+          return_code =
+              packet_builder(clients, i, receive_buffer, return_code, nfds);
+          if (return_code < 0) {
             fprintf(stderr, "WARNING: disconnecting client.\n");
             close_conn = TRUE;
             break;
