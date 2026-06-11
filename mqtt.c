@@ -13,6 +13,7 @@
 #define PCKT_BUF_SIZE 1024
 #define TRUE 1
 #define FALSE 0
+#define DEBUG
 
 typedef struct item {
   char *value;
@@ -149,6 +150,11 @@ int decode_remaining_length(char *bytes, int len) {
     return -1;
   result += ((int)(bytes[1] & 0x7f) << 7);
   if ((bytes[1] & 0x80) == 0) {
+    if (length_bytes(result) != 2) {
+      fprintf(stderr, "WARNING: remaining length has incorrect formatting, "
+                      "disconnecting client.\n");
+      return -2;
+    }
     return result;
   }
 
@@ -156,14 +162,20 @@ int decode_remaining_length(char *bytes, int len) {
     return -1;
   result += ((int)(bytes[2] & 0x7f) << 14);
   if ((bytes[2] & 0x80) == 0) {
+    if (length_bytes(result) != 3) {
+      fprintf(stderr, "WARNING: remaining length has incorrect formatting, "
+                      "disconnecting client.\n");
+      return -2;
+    }
     return result;
   }
   if (len < 4)
     return -1;
   result += ((int)(bytes[3] & 0x7f) << 21);
-  if ((bytes[3] & 0x80) == 0) {
-    fprintf(stderr, "WARNING: remaining length has incorrect formatting - the "
-                    "4th byte has the most significant bit set to 1.");
+  if ((bytes[3] & 0x80) == 0 || length_bytes(result) != 4) {
+    fprintf(stderr, "WARNING: remaining length has incorrect formatting, "
+                    "disconnecting client.\n");
+    return -2;
   }
   return result;
 }
@@ -184,19 +196,22 @@ void encode_remaining_length(int length, char result[4]) {
 
 // this is part of the mechanism for assembling packets, it tries to decode the
 // remaining length so it can get the final packet size
-void update_expected_len(client_t *client) {
+int update_expected_len(client_t *client) {
   if (client->packet.current_len < 2) {
     // not enough data to know the packet size
     client->packet.expected_len = 2;
-    return;
+    return 0;
   }
 
   int len = decode_remaining_length(&(client->packet.data[1]),
                                     client->packet.current_len - 1);
-  if (len < 0) {
+  if (len == -1) {
     // still not enough data to know the packet size
     client->packet.expected_len = client->packet.current_len + 1;
-    return;
+    return 0;
+  } else if (len == -2) {
+    // length encoding is invalid
+    return -1;
   }
 
   // length decoded successfully
@@ -205,7 +220,7 @@ void update_expected_len(client_t *client) {
       1; // remaining length doesnt include the byte for the packet type and
          // flags, and it doesnt include the bytes for the encoded length, so
          // here im adding it back in
-  return;
+  return 0;
 }
 
 int handle_connect_packet(client_t *clients, int cidx, char *response,
@@ -220,6 +235,11 @@ int handle_connect_packet(client_t *clients, int cidx, char *response,
                                    clients[cidx].packet.expected_len);
   if (length < 0) {
     fprintf(stderr, "ERROR: CONNECT packet length decoding failed.\n");
+    return -1;
+  }
+  if (length < 13 + length_bytes(length)) {
+    fprintf(stderr,
+            "WARNING: CONNECT packet too short, disconnecting client.\n");
     return -1;
   }
   position = 1 + length_bytes(length);
@@ -262,9 +282,10 @@ int handle_connect_packet(client_t *clients, int cidx, char *response,
   int clientid_length = clients[cidx].packet.data[position] << 8;
   clientid_length += clients[cidx].packet.data[position + 1];
   position += 2;
-  if (clientid_length > 23) {
+  if (clientid_length > 23 || clientid_length == 0) {
 
-    fprintf(stderr, "WARNING: CONNECT packet has client id longer than 23.\n");
+    fprintf(stderr, "WARNING: CONNECT packet has client id longer than 23, or "
+                    "it's empty.\n");
     response[0] = (char)(CONNACK << 4);
     response[1] = 0x2;
     response[2] = 0;
@@ -303,6 +324,7 @@ int handle_publish_packet(client_t *clients, int cidx, char *response,
   if (length < 0) {
     fprintf(stderr, "WARNING: PUBLISH packet length decoding failed.\n");
   }
+
   position = 1 + length_bytes(length);
 
   int topic_name_length = clients[cidx].packet.data[position] << 8;
@@ -313,6 +335,11 @@ int handle_publish_packet(client_t *clients, int cidx, char *response,
   topic_name[topic_name_length] =
       0; // null terminating it so i can use it in strcmp() in search_slist()
   position += topic_name_length;
+  if (position > length) {
+    fprintf(stderr,
+            "WARNING: PUBLISH packet too short, disconnecting client.\n");
+    return -1;
+  }
   int message_length = clients[cidx].packet.expected_len - position;
   char message[message_length];
   memcpy(message, &(clients[cidx].packet.data[position]), message_length);
@@ -462,6 +489,13 @@ int sub_unsub_packet(client_t *client, char *response) {
 }
 
 int handle_packet(client_t *clients, int cidx, int client_count) {
+#ifdef DEBUG
+  for (int i = 0; i < clients[cidx].packet.expected_len; ++i) {
+    fprintf(stderr, "DEBUG: packet byte %d: %.8b, %c\n", i,
+            (uint8_t)(clients[cidx].packet.data[i]),
+            clients[cidx].packet.data[i]);
+  }
+#endif
 
   char response_buffer[PCKT_BUF_SIZE];
   int response_length = 0;
@@ -525,6 +559,12 @@ int handle_packet(client_t *clients, int cidx, int client_count) {
 
 int packet_builder(client_t *clients, int cidx, char *message, int message_len,
                    int client_count) {
+#ifdef DEBUG
+  for (int i = 0; i < message_len; ++i) {
+    fprintf(stderr, "DEBUG: message byte %d: %.8b, %c\n", i,
+            (uint8_t)(message[i]), message[i]);
+  }
+#endif
   int result = 0;
   while (clients[cidx].packet.current_len + message_len >=
          clients[cidx]
@@ -541,13 +581,19 @@ int packet_builder(client_t *clients, int cidx, char *message, int message_len,
   if (clients[cidx].packet.expected_len == 0) { // no buffered packet part
     memcpy(clients[cidx].packet.data, message, message_len);
     clients[cidx].packet.current_len = message_len;
-    update_expected_len(&clients[cidx]);
+    result = update_expected_len(&clients[cidx]);
 
+    if (result < 0) {
+      return -1;
+    }
   } else {
     memcpy(clients[cidx].packet.data + clients[cidx].packet.current_len,
            message, message_len);
     clients[cidx].packet.current_len += message_len;
-    update_expected_len(&clients[cidx]);
+    result = update_expected_len(&clients[cidx]);
+    if (result < 0) {
+      return -1;
+    }
   }
   while (clients[cidx].packet.current_len >=
              clients[cidx].packet.expected_len &&
@@ -556,6 +602,9 @@ int packet_builder(client_t *clients, int cidx, char *message, int message_len,
                   // loop because theoretically we can receive multiple packets
                   // in one read()
     result = handle_packet(clients, cidx, client_count);
+    if (result < 0) {
+      return -1;
+    }
 
     // the data of the handled packet is not erased, only overwritten
     if (clients[cidx].packet.current_len == clients[cidx].packet.expected_len) {
@@ -571,7 +620,10 @@ int packet_builder(client_t *clients, int cidx, char *message, int message_len,
              (clients[cidx].packet.current_len -
               clients[cidx].packet.expected_len));
       clients[cidx].packet.current_len -= clients[cidx].packet.expected_len;
-      update_expected_len(&clients[cidx]);
+      result = update_expected_len(&clients[cidx]);
+      if (result < 0) {
+        return -1;
+      }
     }
   }
   return result;
