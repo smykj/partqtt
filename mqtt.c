@@ -282,7 +282,7 @@ int handle_connect_packet(client_t *clients, int cidx, char *response,
   int clientid_length = clients[cidx].packet.data[position] << 8;
   clientid_length += clients[cidx].packet.data[position + 1];
   position += 2;
-  if (clientid_length > 23 || clientid_length == 0) {
+  if (clientid_length > 23 || clientid_length <= 0) {
 
     fprintf(stderr, "WARNING: CONNECT packet has client id longer than 23, or "
                     "it's empty.\n");
