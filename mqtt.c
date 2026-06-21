@@ -13,7 +13,6 @@
 #define PCKT_BUF_SIZE 1024
 #define TRUE 1
 #define FALSE 0
-#define DEBUG
 
 typedef struct item {
   char *value;
@@ -326,6 +325,10 @@ int handle_publish_packet(client_t *clients, int cidx, char *response,
   }
 
   position = 1 + length_bytes(length);
+  if (position >= clients[cidx].packet.expected_len) {
+    // payload of length zero
+    return 0;
+  }
 
   int topic_name_length = clients[cidx].packet.data[position] << 8;
   topic_name_length += clients[cidx].packet.data[position + 1];
@@ -489,14 +492,6 @@ int sub_unsub_packet(client_t *client, char *response) {
 }
 
 int handle_packet(client_t *clients, int cidx, int client_count) {
-#ifdef DEBUG
-  for (int i = 0; i < clients[cidx].packet.expected_len; ++i) {
-    fprintf(stderr, "DEBUG: packet byte %d: %.8b, %c\n", i,
-            (uint8_t)(clients[cidx].packet.data[i]),
-            clients[cidx].packet.data[i]);
-  }
-#endif
-
   char response_buffer[PCKT_BUF_SIZE];
   int response_length = 0;
   uint8_t type = (uint8_t)clients[cidx].packet.data[0] >> 4;
@@ -559,12 +554,7 @@ int handle_packet(client_t *clients, int cidx, int client_count) {
 
 int packet_builder(client_t *clients, int cidx, char *message, int message_len,
                    int client_count) {
-#ifdef DEBUG
-  for (int i = 0; i < message_len; ++i) {
-    fprintf(stderr, "DEBUG: message byte %d: %.8b, %c\n", i,
-            (uint8_t)(message[i]), message[i]);
-  }
-#endif
+
   int result = 0;
   while (clients[cidx].packet.current_len + message_len >=
          clients[cidx]
