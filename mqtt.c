@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -701,7 +702,8 @@ int main(int argc, char *argv[]) {
   }
 
   // sets socket to be non-blocking
-  return_code = ioctl(listen_sd, FIONBIO, (char *)&on);
+  return_code = fcntl(listen_sd, F_SETFL, O_NONBLOCK);
+
   if (return_code < 0) {
     perror("ERROR: ioctl() failed");
     close(listen_sd);
